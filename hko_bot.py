@@ -1,14 +1,17 @@
 """
 hko_bot.py
-Telegram bot for querying HKO temperature history.
+Telegram bot for querying HKO temperature data.
 
 Commands:
-    /latest      - return last 5 records (default)
-    /latest N    - return last N records (max 20)
+    /high          - last 5 records from daily high collector
+    /high N        - last N records (max 20)
+    /realtime      - last 5 records from realtime collector
+    /realtime N    - last N records (max 20)
+    /help          - show all commands
 
 Environment variables:
     TG_TOKEN     - Telegram bot token
-    TG_CHAT_ID   - Telegram chat ID (only respond to this user)
+    TG_CHAT_ID   - only respond to this chat ID
 
 Usage:
     python hko_bot.py
@@ -19,16 +22,15 @@ import time
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TG_TOKEN    = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID  = str(os.environ.get("TG_CHAT_ID", ""))
-DATA_FILE   = Path("hko_maxmin_history.parquet")
+HIGH_FILE   = Path("hko_maxmin_history.parquet")
+RT_FILE     = Path("hko_realtime_history.parquet")
 DEFAULT_N   = 5
 MAX_N       = 20
-HKT         = timezone(timedelta(hours=8))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,7 +59,6 @@ def send(chat_id: str, text: str):
 
 
 def get_updates(offset: int | None = None) -> list:
-    """Long polling — waits up to 30s for new messages."""
     params = {"timeout": 30, "allowed_updates": ["message"]}
     if offset is not None:
         params["offset"] = offset
@@ -73,63 +74,79 @@ def get_updates(offset: int | None = None) -> list:
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
-def handle_latest(chat_id: str, n: int):
-    if not DATA_FILE.exists():
-        send(chat_id, "❌ No data collected yet.")
-        return
-
-    df = pd.read_parquet(DATA_FILE)
+def query_parquet(filepath: Path, n: int, title: str, row_fmt) -> str:
+    if not filepath.exists():
+        return "❌ No data collected yet."
+    df = pd.read_parquet(filepath)
     if df.empty:
-        send(chat_id, "❌ Data file is empty.")
-        return
-
+        return "❌ Data file is empty."
     n = min(max(1, n), MAX_N)
     recent = df.tail(n)
-
-    lines = [f"🌡 <b>HKO Last {len(recent)} Records</b>"]
+    lines = [f"🌡 <b>{title} (last {len(recent)})</b>"]
     for _, r in recent.iterrows():
-        t = r["csv_time"]
-        if hasattr(t, "strftime"):
-            t_str = t.strftime("%m-%d %H:%M")
-        else:
-            t_str = str(t)
-        lines.append(
-            f"{t_str}  HKO <b>{r['hko_high']}°C</b>  "
-            f"All-high {r['max_high']}°C ({r['station']})"
-        )
+        lines.append(row_fmt(r))
+    return "\n".join(lines)
 
-    send(chat_id, "\n".join(lines))
+
+def fmt_high(r) -> str:
+    t = r["csv_time"]
+    t_str = t.strftime("%m-%d %H:%M") if hasattr(t, "strftime") else str(t)
+    return f"{t_str}  HKO high <b>{r['hko_high']}°C</b>  All-high {r['max_high']}°C ({r['station']})"
+
+
+def fmt_realtime(r) -> str:
+    t = r["csv_time"]
+    t_str = t.strftime("%m-%d %H:%M") if hasattr(t, "strftime") else str(t)
+    return f"{t_str}  HKO <b>{r['hko_temp']}°C</b>  All-high {r['max_temp']}°C ({r['max_station']})"
+
+
+def parse_n(parts: list) -> int | None:
+    if len(parts) > 1:
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return DEFAULT_N
 
 
 def handle_message(message: dict):
     chat_id = str(message.get("chat", {}).get("id", ""))
     text    = message.get("text", "").strip()
 
-    # Only respond to authorised user
     if chat_id != TG_CHAT_ID:
-        log.warning(f"Ignored message from unknown chat_id: {chat_id}")
+        log.warning(f"Ignored message from: {chat_id}")
         return
 
-    if text.startswith("/latest"):
-        parts = text.split()
-        n = DEFAULT_N
-        if len(parts) > 1:
-            try:
-                n = int(parts[1])
-            except ValueError:
-                send(chat_id, f"⚠️ Usage: /latest or /latest N (max {MAX_N})")
-                return
-        handle_latest(chat_id, n)
+    parts = text.split()
+    cmd   = parts[0].lower() if parts else ""
 
-    elif text.startswith("/help") or text.startswith("/start"):
+    if cmd in ("/high", "/daily"):
+        n = parse_n(parts)
+        if n is None:
+            send(chat_id, f"⚠️ Usage: /high or /high N (max {MAX_N})")
+            return
+        msg = query_parquet(HIGH_FILE, n, "Daily High Temp", fmt_high)
+        send(chat_id, msg)
+
+    elif cmd in ("/realtime", "/rt"):
+        n = parse_n(parts)
+        if n is None:
+            send(chat_id, f"⚠️ Usage: /realtime or /realtime N (max {MAX_N})")
+            return
+        msg = query_parquet(RT_FILE, n, "Realtime Temp", fmt_realtime)
+        send(chat_id, msg)
+
+    elif cmd in ("/help", "/start"):
         send(chat_id, (
             "🌡 <b>HKO Weather Bot</b>\n\n"
-            f"/latest — last {DEFAULT_N} records\n"
-            f"/latest N — last N records (max {MAX_N})"
+            f"/high — last {DEFAULT_N} daily high records\n"
+            f"/high N — last N records (max {MAX_N})\n\n"
+            f"/realtime — last {DEFAULT_N} realtime records\n"
+            f"/realtime N — last N records (max {MAX_N})"
         ))
 
     else:
-        send(chat_id, "Unknown command. Try /latest or /help")
+        send(chat_id, "Unknown command. Try /high, /realtime, or /help")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -140,7 +157,7 @@ def main():
         return
 
     log.info("HKO bot started, listening for commands...")
-    send(TG_CHAT_ID, "🤖 HKO bot is online. Try /latest or /help")
+    send(TG_CHAT_ID, "🤖 HKO bot online.\n/high — daily high\n/realtime — realtime temp\n/help — all commands")
 
     offset = None
     while True:
