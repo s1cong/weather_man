@@ -81,7 +81,7 @@ def fetch_csv() -> pd.DataFrame | None:
         r = requests.get(URL, timeout=15)
         r.raise_for_status()
         r.encoding = "utf-8-sig"
-        df = pd.read_csv(StringIO(r.text), sep="\t")
+        df = pd.read_csv(StringIO(r.text))
         df.columns = df.columns.str.strip()
         return df
     except Exception as e:
