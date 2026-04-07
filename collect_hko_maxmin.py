@@ -26,7 +26,7 @@ import logging
 URL            = "https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_since_midnight_maxmin.csv"
 OUTPUT         = "hko_maxmin_history.parquet"
 LOG_FILE       = "hko_maxmin_collect.log"
-POLL_SEC       = 60 * 5
+POLL_SEC       = 60 
 HKT            = timezone(timedelta(hours=8))
 TARGET_STATION = "HK Observatory"
 
