@@ -63,7 +63,7 @@ def tg_send(msg: str):
 def tg_push_latest(history: pd.DataFrame):
     """推送 parquet 里最新5条数据"""
     recent = history.tail(5)
-    lines = ["🌡 <b>HKO 最新数据</b>"]
+    lines = ["🌡 <b>HKO 截止目前最高温</b>"]
     for _, r in recent.iterrows():
         lines.append(
             f"{r['csv_time'].strftime('%m-%d %H:%M')}  "
