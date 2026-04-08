@@ -87,17 +87,22 @@ PRICE_SCHEMA = pa.schema([
 def append_rows(rows: list[dict]):
     if not rows:
         return
-    date_str = hkt_now().strftime("%Y-%m-%d")
-    path = DATA_DIR / "price_ticks" / f"date={date_str}"
-    path.mkdir(parents=True, exist_ok=True)
-    path = path / "data.parquet"
+    import pyarrow.compute as pc
     new_table = pa.Table.from_pylist(rows, schema=PRICE_SCHEMA)
-    if path.exists():
-        existing = pq.read_table(path)
-        combined = pa.concat_tables([existing, new_table])
-    else:
-        combined = new_table
-    pq.write_table(combined, path, compression="snappy")
+    for event_slug in new_table.column("event_slug").unique().to_pylist():
+        mask = pc.equal(new_table.column("event_slug"), event_slug)
+        event_table = new_table.filter(mask)
+        path = DATA_DIR / "price_ticks" / f"event={event_slug}"
+        path.mkdir(parents=True, exist_ok=True)
+        path = path / "data.parquet"
+        if path.exists():
+            existing = pq.read_table(path)
+            existing = existing.select([f.name for f in PRICE_SCHEMA])
+            existing = existing.cast(PRICE_SCHEMA)
+            combined = pa.concat_tables([existing, event_table])
+        else:
+            combined = event_table
+        pq.write_table(combined, path, compression="snappy")
     log.info(f"已写入 {len(rows)} 条价格记录")
 
 
