@@ -77,6 +77,7 @@ PRICE_SCHEMA = pa.schema([
     pa.field("market_slug", pa.string()),
     pa.field("question",    pa.string()),
     pa.field("event_slug",  pa.string()),
+    pa.field("outcome", pa.string()),
     pa.field("best_bid",    pa.float32()),
     pa.field("best_ask",    pa.float32()),
     pa.field("mid",         pa.float32()),
@@ -97,8 +98,11 @@ def append_rows(rows: list[dict]):
         path = path / "data.parquet"
         if path.exists():
             existing = pq.read_table(path)
-            existing = existing.select([f.name for f in PRICE_SCHEMA])
-            existing = existing.cast(PRICE_SCHEMA)
+            existing = existing.select([f.name for f in PRICE_SCHEMA if f.name in existing.schema.names])
+            existing = existing.cast(pa.schema([f for f in PRICE_SCHEMA if f.name in existing.schema.names]))
+            for f in PRICE_SCHEMA:
+                if f.name not in existing.schema.names:
+                    existing = existing.append_column(f.name, pa.array([None]*len(existing), type=f.type))
             combined = pa.concat_tables([existing, event_table])
         else:
             combined = event_table
@@ -164,7 +168,12 @@ def fetch_all_markets() -> list[dict]:
 
     if all_markets:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(all_markets).to_parquet(DATA_DIR / "market_meta.parquet", index=False)
+        meta_path = DATA_DIR / "market_meta.parquet"
+        new_meta = pd.DataFrame(all_markets)
+        if meta_path.exists():
+            old_meta = pd.read_parquet(meta_path)
+            new_meta = pd.concat([old_meta, new_meta], ignore_index=True).drop_duplicates('token_id')
+        new_meta.to_parquet(meta_path, index=False)
 
     return all_markets
 
@@ -232,6 +241,7 @@ class OrderbookTracker:
                 "market_slug": meta["market_slug"],
                 "question":    meta["question"],
                 "event_slug":  meta["event_slug"],
+                "outcome": meta["outcome"],
                 "best_bid":    bb,
                 "best_ask":    ba,
                 "mid":         (bb + ba) / 2,
