@@ -88,25 +88,18 @@ PRICE_SCHEMA = pa.schema([
 def append_rows(rows: list[dict]):
     if not rows:
         return
-    import pyarrow.compute as pc
-    new_table = pa.Table.from_pylist(rows, schema=PRICE_SCHEMA)
-    for event_slug in new_table.column("event_slug").unique().to_pylist():
-        mask = pc.equal(new_table.column("event_slug"), event_slug)
-        event_table = new_table.filter(mask)
+    new_df = pd.DataFrame(rows)
+    for event_slug in new_df['event_slug'].unique():
+        event_df = new_df[new_df['event_slug'] == event_slug].copy()
         path = DATA_DIR / "price_ticks" / f"event={event_slug}"
         path.mkdir(parents=True, exist_ok=True)
         path = path / "data.parquet"
         if path.exists():
-            existing = pq.read_table(path)
-            existing = existing.select([f.name for f in PRICE_SCHEMA if f.name in existing.schema.names])
-            existing = existing.cast(pa.schema([f for f in PRICE_SCHEMA if f.name in existing.schema.names]))
-            for f in PRICE_SCHEMA:
-                if f.name not in existing.schema.names:
-                    existing = existing.append_column(f.name, pa.array([None]*len(existing), type=f.type))
-            combined = pa.concat_tables([existing, event_table])
+            existing = pd.read_parquet(path)
+            combined = pd.concat([existing, event_df], ignore_index=True)
         else:
-            combined = event_table
-        pq.write_table(combined, path, compression="snappy")
+            combined = event_df
+        combined.to_parquet(path, compression='snappy', index=False)
     log.info(f"已写入 {len(rows)} 条价格记录")
 
 
