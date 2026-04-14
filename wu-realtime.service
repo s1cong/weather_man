@@ -1,0 +1,15 @@
+[Unit]
+Description=WU Realtime Collector
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/weather_man
+ExecStart=/home/ubuntu/venv/bin/python3 /home/ubuntu/weather_man/collect_wu_realtime.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/weather_man/collect_wu_realtime.log
+StandardError=append:/home/ubuntu/weather_man/collect_wu_realtime.log
+
+[Install]
+WantedBy=multi-user.target
