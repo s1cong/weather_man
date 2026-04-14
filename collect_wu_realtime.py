@@ -8,10 +8,7 @@ from datetime import datetime, timezone
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("/home/ubuntu/weather_man/collect_wu_realtime.log"),
-        logging.StreamHandler(),
-    ],
+    handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
 
