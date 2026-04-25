@@ -1,40 +1,29 @@
 """
 collect_ob_snapshot.py
-订阅 Polymarket 指定 event 下所有 YES token 的 orderbook，
+订阅 Polymarket HK 最高温 event 下所有 YES token 的 orderbook，
 维护内存 ob 状态，每次任意一档 ask 发生变化时存一行 5 档快照。
 
+- 自动发现今天+后两天共 3 个 event
+- 每个 event 数据存进各自对应的 parquet（按 event 日期命名）
+- 每小时重新检查是否有新 event 上线
+- 每个 event 到当天 HKT 24:00 后停止采集
+
 用法:
-    python collect_ob_snapshot.py --event "highest-temperature-in-hong-kong-on-april-24-2026"
+    python collect_ob_snapshot.py
 
 存储路径:
     /home/ubuntu/weather_man/poly_data/ob_snapshots/YYYY-MM-DD.parquet
-    每天一个文件，所有 YES token 在同一文件，用 token_id 区分。
-
-Schema:
-    timestamp   datetime64[us, Asia/Hong_Kong]
-    token_id    str
-    ask1_price  float32
-    ask1_size   float32
-    ask2_price  float32
-    ask2_size   float32
-    ask3_price  float32
-    ask3_size   float32
-    ask4_price  float32
-    ask4_size   float32
-    ask5_price  float32
-    ask5_size   float32
 """
 
-import argparse
 import json
 import logging
+import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
@@ -45,10 +34,17 @@ import websocket
 # ──────────────────────────────────────────────
 GAMMA_API    = "https://gamma-api.polymarket.com"
 CLOB_WS      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-DATA_DIR     = Path("/home/ubuntu/weather_man/poly_data/ob_snapshots")
-WS_RECONNECT = 10   # 秒：断线重连等待
-FLUSH_EVERY  = 30   # 秒：批量写盘间隔
+# DATA_DIR     = Path("/home/ubuntu/weather_man/poly_data/ob_snapshots")
+DATA_DIR = Path("/Users/eric/Developer/poly_data/ob_snapshots")
+WS_RECONNECT = 10
+FLUSH_EVERY  = 30
+TRACK_DAYS   = 3
 HKT          = ZoneInfo("Asia/Hong_Kong")
+
+MONTHS = {
+    "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,8 +57,32 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def slug_to_bucket(slug):
-    import re
+# ──────────────────────────────────────────────
+# 工具函数
+# ──────────────────────────────────────────────
+
+def hkt_now() -> datetime:
+    return datetime.now(timezone.utc).astimezone(HKT)
+
+
+def slug_for_date(dt: datetime) -> str:
+    month = dt.strftime("%B").lower()
+    return f"highest-temperature-in-hong-kong-on-{month}-{dt.day}-{dt.year}"
+
+
+def target_slugs() -> list[str]:
+    today = hkt_now()
+    return [slug_for_date(today + timedelta(days=i)) for i in range(TRACK_DAYS)]
+
+
+def parse_event_date(slug: str) -> date:
+    m = re.search(r'-on-(\w+)-(\d+)-(\d{4})$', slug)
+    if m:
+        return date(int(m.group(3)), MONTHS[m.group(1)], int(m.group(2)))
+    raise ValueError(f"无法从 slug 解析日期: {slug}")
+
+
+def slug_to_bucket(slug: str) -> str:
     m = re.search(r'-(\d+)c?or.?below', slug)
     if m: return f"{m.group(1)}-"
     m = re.search(r'-(\d+)c?or.?higher', slug)
@@ -71,41 +91,30 @@ def slug_to_bucket(slug):
     if m: return m.group(1)
     return slug
 
+
 # ──────────────────────────────────────────────
 # Parquet Schema
 # ──────────────────────────────────────────────
+
 OB_SCHEMA = pa.schema([
     pa.field("timestamp",  pa.timestamp("us", tz="Asia/Hong_Kong")),
-    pa.field("bucket", pa.string()),
-    pa.field("ask1_price", pa.float32()),
-    pa.field("ask1_size",  pa.float32()),
-    pa.field("ask2_price", pa.float32()),
-    pa.field("ask2_size",  pa.float32()),
-    pa.field("ask3_price", pa.float32()),
-    pa.field("ask3_size",  pa.float32()),
-    pa.field("ask4_price", pa.float32()),
-    pa.field("ask4_size",  pa.float32()),
-    pa.field("ask5_price", pa.float32()),
-    pa.field("ask5_size",  pa.float32()),
+    pa.field("bucket",     pa.string()),
+    pa.field("ask1_price", pa.float32()), pa.field("ask1_size", pa.float32()),
+    pa.field("ask2_price", pa.float32()), pa.field("ask2_size", pa.float32()),
+    pa.field("ask3_price", pa.float32()), pa.field("ask3_size", pa.float32()),
+    pa.field("ask4_price", pa.float32()), pa.field("ask4_size", pa.float32()),
+    pa.field("ask5_price", pa.float32()), pa.field("ask5_size", pa.float32()),
 ])
 
-EMPTY_ASK = {"price": float("nan"), "size": 0.0}
 
-
-def _today_path() -> Path:
-    date_str = datetime.now(HKT).strftime("%Y-%m-%d")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return DATA_DIR / f"{date_str}.parquet"
-
-
-def append_rows(rows: list[dict]):
+def append_rows(rows: list[dict], event_date: date):
     if not rows:
         return
-    path = _today_path()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / f"{event_date}.parquet"
     new_table = pa.Table.from_pylist(rows, schema=OB_SCHEMA)
     if path.exists():
-        existing = pq.read_table(path)
-        combined = pa.concat_tables([existing, new_table])
+        combined = pa.concat_tables([pq.read_table(path), new_table])
     else:
         combined = new_table
     pq.write_table(combined, path, compression="snappy")
@@ -113,26 +122,17 @@ def append_rows(rows: list[dict]):
 
 
 # ──────────────────────────────────────────────
-# Gamma API：拉 YES token 列表
+# Gamma API：拉所有 event 的 YES token
 # ──────────────────────────────────────────────
+
 def fetch_yes_tokens(event_slug: str) -> list[dict]:
-    log.info(f"查询 event: {event_slug}")
     r = requests.get(f"{GAMMA_API}/events", params={"slug": event_slug}, timeout=15)
     r.raise_for_status()
     events = r.json()
-
     if not events:
-        log.warning("slug 未匹配，尝试关键词搜索...")
-        r = requests.get(f"{GAMMA_API}/events", params={"q": event_slug, "limit": 10}, timeout=15)
-        r.raise_for_status()
-        events = r.json()
-
-    if not events:
-        raise ValueError(f"找不到 event: {event_slug}")
+        return []
 
     event = events[0] if isinstance(events, list) else events
-    log.info(f"找到 event: {event.get('title', '?')}")
-
     tokens = []
     for m in event.get("markets", []):
         clob_ids = m.get("clobTokenIds", [])
@@ -142,115 +142,118 @@ def fetch_yes_tokens(event_slug: str) -> list[dict]:
             except Exception:
                 clob_ids = [clob_ids]
         if clob_ids:
-            # index 0 = YES token
             tokens.append({
                 "token_id":    clob_ids[0],
                 "market_slug": m.get("slug", ""),
                 "question":    m.get("question", ""),
-                "bucket":      slug_to_bucket(m.get("slug", "")),  # 新增
+                "bucket":      slug_to_bucket(m.get("slug", "")),
+                "event_slug":  event_slug,
+                "event_date":  parse_event_date(event_slug),
             })
-
-    log.info(f"共找到 {len(tokens)} 个 YES token")
     return tokens
+
+
+def fetch_all_tokens() -> list[dict]:
+    slugs = target_slugs()
+    all_tokens = []
+    seen = set()
+    for slug in slugs:
+        tokens = fetch_yes_tokens(slug)
+        if tokens:
+            log.info(f"✓ {slug}  →  {len(tokens)} 个 YES token")
+        else:
+            log.info(f"✗ {slug}  →  未找到")
+        for t in tokens:
+            if t["token_id"] not in seen:
+                seen.add(t["token_id"])
+                all_tokens.append(t)
+    return all_tokens
 
 
 # ──────────────────────────────────────────────
 # OB 状态维护 + 快照记录
 # ──────────────────────────────────────────────
+
 class ObSnapshotTracker:
-    def __init__(self, tokens: list[dict]):
-        self.tokens     = tokens
-        self.token_ids  = {t["token_id"] for t in tokens}
-
-        # 内存 ob：token_id → { price_str → size_float }
-        # 只维护 asks（卖方挂单），不存 bids
-        self._asks: dict[str, dict[str, float]] = {t["token_id"]: {} for t in tokens}
-
-        # 上一次存快照时的 top5，用于去重
+    def __init__(self):
+        self.token_meta: dict[str, dict] = {}
+        self._asks: dict[str, dict[str, float]] = {}
         self._last_top5: dict[str, list] = {}
+        self._pending: dict[date, list[dict]] = {}   # event_date → rows
+        self._lock = threading.Lock()
 
-        self._pending: list[dict] = []
-        self._lock    = threading.Lock()
-        self.token_meta = {t["token_id"]: t for t in tokens}
+    def update_tokens(self, tokens: list[dict]):
+        new_meta = {t["token_id"]: t for t in tokens}
+        added = set(new_meta) - set(self.token_meta)
+        self.token_meta = new_meta
+        for tid in added:
+            self._asks[tid] = {}
+        if added:
+            log.info(f"新增 {len(added)} 个 token，下次重连后生效")
 
-    # ── 从 asks dict 取 top5 ──────────────────
     @staticmethod
     def _top5(asks: dict[str, float]) -> list[tuple[float, float]]:
-        """返回价格最低的 5 档 (price, size)，不足 5 档用 nan/0 填充"""
-        sorted_asks = sorted(
+        result = sorted(
             ((float(p), s) for p, s in asks.items() if s > 0),
             key=lambda x: x[0]
-        )
-        result = sorted_asks[:5]
+        )[:5]
         while len(result) < 5:
             result.append((float("nan"), 0.0))
         return result
 
-    # ── 处理 book snapshot（订阅后第一条完整 ob）──
     def _handle_book(self, msg: dict):
         token_id = msg.get("asset_id", "")
-        if token_id not in self.token_ids:
+        if token_id not in self.token_meta:
             return
-
-        asks_raw = msg.get("asks", [])
-        new_asks  = {}
-        for item in asks_raw:
+        new_asks = {}
+        for item in msg.get("asks", []):
             price = str(item.get("price", ""))
             size  = float(item.get("size", 0))
             if price and size > 0:
                 new_asks[price] = size
-
         self._asks[token_id] = new_asks
         self._maybe_snapshot(token_id)
-        log.debug(f"[BOOK] {token_id[:12]}...  asks={len(new_asks)} 档")
 
-    # ── 处理 price_change（增量更新）────────────
     def _handle_price_change(self, msg: dict):
         for pc in msg.get("price_changes", []):
             token_id = pc.get("asset_id", "")
-            if token_id not in self.token_ids:
+            if token_id not in self.token_meta:
                 continue
-            side  = pc.get("side", "").upper()
-            if side != "SELL":
-                # 只关心 asks（SELL side）
+            if pc.get("side", "").upper() != "SELL":
                 continue
-
             price = str(pc.get("price", ""))
             size  = float(pc.get("size", 0))
-
             if size == 0:
                 self._asks[token_id].pop(price, None)
             else:
                 self._asks[token_id][price] = size
-
             self._maybe_snapshot(token_id)
 
-    # ── 如果 top5 发生变化就记录快照 ──────────
     def _maybe_snapshot(self, token_id: str):
-        top5 = self._top5(self._asks[token_id])
+        meta = self.token_meta[token_id]
+        event_date = meta["event_date"]
+        # event 当天 HKT 24:00 后停止采集
+        if hkt_now().date() > event_date:
+            return
+        top5 = self._top5(self._asks.get(token_id, {}))
         if top5 == self._last_top5.get(token_id):
             return
         self._last_top5[token_id] = top5
-
-        now = datetime.now(HKT)
-        row = {"timestamp": now, "bucket": self.token_meta[token_id]["bucket"]}
+        row = {"timestamp": hkt_now(), "bucket": meta["bucket"]}
         for i, (price, size) in enumerate(top5, start=1):
             row[f"ask{i}_price"] = price
             row[f"ask{i}_size"]  = size
-
         with self._lock:
-            self._pending.append(row)
+            self._pending.setdefault(event_date, []).append(row)
 
-    # ── WebSocket 回调 ────────────────────────
     def on_open(self, ws):
-        sub = {"assets_ids": [t["token_id"] for t in self.tokens], "type": "market"}
-        ws.send(json.dumps(sub))
-        log.info(f"WS 已订阅 {len(self.tokens)} 个 YES token")
+        token_ids = list(self.token_meta.keys())
+        ws.send(json.dumps({"assets_ids": token_ids, "type": "market"}))
+        log.info(f"WS 已订阅 {len(token_ids)} 个 YES token")
 
     def on_message(self, ws, raw):
         try:
             data = json.loads(raw)
-            # book snapshot 是 list
             if isinstance(data, list):
                 for msg in data:
                     self._handle_book(msg)
@@ -269,20 +272,21 @@ class ObSnapshotTracker:
     def on_close(self, ws, code, msg):
         log.warning(f"WS 断开: code={code}")
 
-    # ── 后台 flush 线程 ───────────────────────
     def flush_loop(self):
         while True:
             time.sleep(FLUSH_EVERY)
             with self._lock:
-                rows = self._pending[:]
+                pending = {k: v[:] for k, v in self._pending.items()}
                 self._pending.clear()
-            if rows:
-                append_rows(rows)
+            for event_date, rows in pending.items():
+                append_rows(rows, event_date)
 
-    # ── 主循环（带断线重连）──────────────────
     def run(self):
         threading.Thread(target=self.flush_loop, daemon=True).start()
         while True:
+            if not self.token_meta:
+                time.sleep(10)
+                continue
             try:
                 ws = websocket.WebSocketApp(
                     CLOB_WS,
@@ -299,26 +303,39 @@ class ObSnapshotTracker:
 
 
 # ──────────────────────────────────────────────
+# 每小时刷新 event 列表
+# ──────────────────────────────────────────────
+
+def refresh_loop(tracker: ObSnapshotTracker):
+    while True:
+        time.sleep(3600)
+        log.info("刷新 event 列表...")
+        tokens = fetch_all_tokens()
+        if tokens:
+            tracker.update_tokens(tokens)
+
+
+# ──────────────────────────────────────────────
 # 主入口
 # ──────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="Polymarket OB snapshot collector")
-    parser.add_argument(
-        "--event",
-        required=True,
-        help="Event slug，例如 highest-temperature-in-hong-kong-on-april-24-2026",
-    )
-    args = parser.parse_args()
+    log.info(f"追踪 {TRACK_DAYS} 天 event: {target_slugs()}")
 
-    tokens = fetch_yes_tokens(args.event)
-    log.info("YES token 列表:")
-    for t in tokens:
-        log.info(f"  {t['question'][:60]}  token={t['token_id'][:16]}...")
+    tokens = fetch_all_tokens()
+    if not tokens:
+        log.error("未找到任何 event，退出")
+        return
 
-    tracker = ObSnapshotTracker(tokens)
+    tracker = ObSnapshotTracker()
+    tracker.update_tokens(tokens)
+
+    threading.Thread(target=refresh_loop, args=(tracker,), daemon=True, name="Refresher").start()
+
     log.info("OB snapshot 采集启动...")
     tracker.run()
 
 
 if __name__ == "__main__":
     main()
+
