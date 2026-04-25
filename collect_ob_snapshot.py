@@ -34,8 +34,7 @@ import websocket
 # ──────────────────────────────────────────────
 GAMMA_API    = "https://gamma-api.polymarket.com"
 CLOB_WS      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-# DATA_DIR     = Path("/home/ubuntu/weather_man/poly_data/ob_snapshots")
-DATA_DIR = Path("/Users/eric/Developer/poly_data/ob_snapshots")
+DATA_DIR     = Path("/home/ubuntu/weather_man/poly_data/ob_snapshots")
 WS_RECONNECT = 10
 FLUSH_EVERY  = 30
 TRACK_DAYS   = 3
