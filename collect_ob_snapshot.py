@@ -66,7 +66,7 @@ def hkt_now() -> datetime:
 
 def slug_for_date(dt: datetime) -> str:
     month = dt.strftime("%B").lower()
-    return f"highest-temperature-in-hong-kong-on-{month}-{dt.day}-{dt.year}"
+    return f"highest-temperature-in-istanbul-on-{month}-{dt.day}-{dt.year}"
 
 
 def target_slugs() -> list[str]:
@@ -218,7 +218,8 @@ class ObSnapshotTracker:
             token_id = pc.get("asset_id", "")
             if token_id not in self.token_meta:
                 continue
-            
+            if pc.get("side", "").upper() != "SELL":
+                continue
             price = str(pc.get("price", ""))
             size  = float(pc.get("size", 0))
             if size == 0:
